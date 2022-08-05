@@ -17,10 +17,14 @@
          nevero)
 
 (module+ test
-  (require rackunit))
+  (require (except-in rackunit fail)))
 
+; variables
 (define (make-var name) (vector name))
 (define (var? v) (vector? v))
+; examples
+(define x-v (make-var 'x))
+(define y-v (make-var 'y))
 
 ; supported values
 (define (value? v) ((or/c var? number? boolean? symbol? (cons/c value?)) v))
@@ -45,6 +49,13 @@
         (walk (cdr association) sub) ; recursion is necessary in case val is associated to another var
         val)))
 
+(module+ test
+  (check-equal? (walk 1 empty-sub) 1)
+  (check-equal? (walk x-v `((,x-v . 1))) 1)
+  (check-equal? (walk x-v `((,y-v . 1))) x-v)
+  (check-equal? (walk x-v `((,y-v . 2) (,x-v . 1))) 1)
+  (check-equal? (walk x-v `((,x-v . ,y-v) (,y-v . 1))) 1))
+
 #; (-> var? value? substitution? (or/c #f substitution?))
 ; extend the substitution with (cons x val) if it would not lead to a cycle, #f otherwise
 (define (extend-sub x val sub)
@@ -64,6 +75,18 @@
       ; atomic
       [else #f])))
 
+(module+ test
+  (check-equal? (occurs? x-v x-v empty-sub) #t)
+  (check-equal? (occurs? x-v y-v `((,y-v . ,x-v))) #t)
+  ; this shouldn't naturally happen
+  (check-equal? (occurs? x-v y-v `((,x-v . ,y-v))) #f)
+  (check-equal? (occurs? x-v `(1 2 ,x-v) empty-sub) #t)
+  (check-equal? (occurs? x-v `(1 2 ,y-v) `((,y-v . ,x-v))) #t)
+  (check-equal? (occurs? x-v 1 empty-sub) #f)
+  (check-equal? (occurs? x-v y-v empty-sub) #f)
+  (check-equal? (occurs? 1 x-v empty-sub) #f)
+  (check-equal? (occurs? 1 x-v `((,x-v . 1))) #f))
+
 #; (-> value? value? substitution? substitution?)
 ; update the substitution to make u and v equal if possible, #f otherwise
 (define (unify u v sub)
@@ -78,10 +101,36 @@
          (and sub (unify (cdr u) (cdr v) sub)))]
       [else #f])))
 
+(module+ test
+  (check-equal? (unify 1 1 empty-sub) empty-sub)
+  (check-equal? (unify '(1 2 3) '(1 2 3) empty-sub) empty-sub)
+  (check-equal? (unify 1 2 empty-sub) #f)
+  (check-equal? (unify '(1 2 3) '(1 2) empty-sub) #f)
+  (check-equal? (unify x-v y-v empty-sub) `((,x-v . ,y-v)))
+  (check-equal? (unify x-v x-v empty-sub) empty-sub)
+  (check-equal? (unify x-v (list 1 y-v) empty-sub) `((,x-v . (1 ,y-v))))
+  (check-equal? (unify x-v (list 1 x-v) empty-sub) #f)
+  (check-equal? (unify 1 x-v empty-sub) `((,x-v . 1)))
+  (check-equal? (unify (list x-v y-v) (list 1 2) empty-sub) `((,y-v . 2) (,x-v . 1)))
+  (check-equal? (unify (list 1 2) (list x-v y-v) empty-sub) `((,y-v . 2) (,x-v . 1)))
+  (check-equal? (unify (list x-v 2) (list 1 y-v) empty-sub) `((,y-v . 2) (,x-v . 1)))
+  ; make sure u and v get walked
+  (check-equal? (unify x-v (list 1 2) `((,x-v . (1 2)))) `((,x-v . (1 2))))
+  (check-equal? (unify (list 1 2) x-v `((,x-v . (1 2)))) `((,x-v . (1 2))))
+  (check-equal? (unify x-v (list 1 2) `((,x-v . ,y-v))) `((,y-v . (1 2)) (,x-v . ,y-v)))
+  (check-equal? (unify (list 1 2) x-v `((,x-v . ,y-v))) `((,y-v . (1 2)) (,x-v . ,y-v)))
+  (check-equal? (unify x-v (list 1 2) `((,x-v . (1 2 3)))) #f)
+  (check-equal? (unify (list 1 2) x-v `((,x-v . (1 2 3)))) #f))
+
 (define (stream? v [element? any/c])
   (or (equal? v '())
       (and (cons? v) (element? (car v)) (stream? (cdr v) element?))
       ((-> (stream-of element?)) v)))
+(define ones (cons 1 (λ () ones)))
+(define twos (cons 2 (λ () twos)))
+(define (nats-from n) (cons n (λ () (nats-from (add1 n)))))
+(define nats (nats-from 0))
+(define never-stream (λ () never-stream))
 (define ((stream-of element/c) v) (stream? v element/c))
 (define substitution-stream? (stream-of substitution?))
 ; a goal succeeds if the stream is non-empty
@@ -115,7 +164,21 @@
     [(null? s1) s2]
     [(cons? s1) (cons (car s1) (append-stream (cdr s1) s2))]
     ; s1 is a suspension, force it and swap for bfs behavior
+    ; if you move to promises, don't use lazy bc you only want to force one level at a time
     [else (lambda () (append-stream s2 (s1)))]))
+
+(module+ test
+  (check-equal? (append-stream '() '()) '())
+  (check-equal? (append-stream '() '(1 2 3)) '(1 2 3))
+  (check-equal? (append-stream '(1 2 3) '()) '(1 2 3))
+  (check-equal? (append-stream '(1 2 3) '(4 5 6)) '(1 2 3 4 5 6))
+  (check-pred procedure? (append-stream (thunk '(1)) '(2)))
+  (check-equal? (take-stream #f (append-stream (thunk '(1)) '(2))) '(2 1))
+  (check-equal? (take-stream #f (append-stream (thunk '(1)) (thunk '(2)))) '(1 2))
+  (check-equal? (take-stream 6 (append-stream ones twos)) '(1 2 1 2 1 2))
+  (check-equal? (take-stream 3 (append-stream never-stream ones)) '(1 1 1))
+  (check-equal? (take-stream 3 (append-stream ones never-stream)) '(1 1 1))
+  (check-equal? (take-stream 4 (append-stream (list* 3 3 never-stream) ones)) '(3 3 1 1)))
 
 #; goal?
 ; a goal that never succeeds nor fails
@@ -141,6 +204,17 @@
      (cons (car s) (take-stream (and n (sub1 n)) (cdr s)))]
     [else (take-stream n (s))]))
 
+(module+ test
+  (check-equal? (take-stream 3 '(1 2 3 4)) '(1 2 3))
+  (check-equal? (take-stream #f '(1 2 3 4)) '(1 2 3 4))
+  (check-equal? (take-stream 2 '()) '())
+  (check-equal? (take-stream 0 '(1 2 3)) '())
+  (check-equal? (take-stream 0 '()) '())
+  (check-equal? (take-stream 5 ones) '(1 1 1 1 1))
+  (check-equal? (take-stream 0 never-stream) '())
+  (check-equal? (take-stream 3 (thunk '(1 2 3 4))) '(1 2 3))
+  (check-equal? (take-stream 3 (thunk (cons 1 (thunk (cons 2 (cons 3 (thunk (error 'boom)))))))) '(1 2 3)))
+
 #; (-> goal? goal? goal?)
 ; succeeds iff both goals succeed
 (define (conj2 g1 g2)
@@ -158,6 +232,16 @@
      (lambda ()
        (append-map-stream f (s)))]))
 
+(module+ test
+  (check-equal? (append-map-stream list '(1 2 3)) '(1 2 3))
+  (check-equal? (append-map-stream (thunk* (error 'boom)) '()) '())
+  (check-equal? (append-map-stream (λ (x) (list x x)) '(1 2 3)) '(1 1 2 2 3 3))
+  (check-equal? (take-stream 4 (append-map-stream (λ (x) (list x #f)) ones)) '(1 #f 1 #f))
+  (define (repeat x) (thunk (cons x (repeat x))))
+  ; don't understand this pattern, but it does seem to interleave
+  ; the interaction between the lazy case and appending in the cons case is very subtle. not sure if this is a bug
+  (check-equal? (take-stream 15 (append-map-stream repeat (thunk nats))) '(0 0 0 1 0 0 1 0 0 1 0 2 0 1 0)))
+
 #; (-> symbol? (-> var? goal?) goal?)
 ; call `f` with a fresh variable named `name`
 (define (call/fresh name f)
@@ -174,12 +258,21 @@
        (cons (walk* (car val) sub) (walk* (cdr val) sub))]
       [else val])))
 
+(module+ test
+  (check-equal? (walk* 1 empty-sub) 1)
+  (check-equal? (walk* x-v empty-sub) x-v)
+  (check-equal? (walk* x-v `((,x-v . ,y-v))) y-v)
+  (check-equal? (walk* (list x-v) `((,x-v . ,y-v))) (list y-v))
+  (check-equal? (walk* `((,x-v ,y-v)) `((,x-v . (,y-v)) (,y-v . 1))) '(((1) 1))))
+
 (define reified-name-substitution? (listof (cons/c var? var?)))
 
 #; (-> natural? symbol?)
 ; create a reified name using n
 (define (reify-name n)
   (string->symbol (string-append "_." (number->string n))))
+
+(module+ test (check-equal? (reify-name 2) '_.2))
 
 #; (-> value? reified-name-substitution? reified-name-substitution?)
 ; creates a mapping from names to reified names for the value in leftmost-innermost order
@@ -196,13 +289,27 @@
          (reify-sub (cdr val) sub))]
       [else sub])))
 
+(module+ test
+  (check-equal? (reify-sub x-v) `((,x-v . _.0)))
+  (check-equal? (reify-sub (list x-v)) `((,x-v . _.0)))
+  (check-equal? (reify-sub (list x-v y-v)) `((,y-v . _.1) (,x-v . _.0)))
+  (check-equal? (reify-sub (list x-v y-v 1 x-v)) `((,y-v . _.1) (,x-v . _.0)))
+  (check-equal? (reify-sub (list x-v 1 (list y-v x-v))) `((,y-v . _.1) (,x-v . _.0))))
+
 #; (-> value? (-> substitution? value?))
 ; reifies fresh vars in val under sub. curried
 (define ((reify val) sub)
   (let* ([val (walk* val  sub)]
-        [rsub (reify-sub val)])
+         [rsub (reify-sub val)])
     ; this reifies the variables according to the reified name substitution
     (walk* val rsub)))
+
+(module+ test
+  (check-equal? ((reify (list x-v 1)) empty-sub) '(_.0 1))
+  (check-equal? ((reify (list x-v 1)) `((,x-v . (,y-v ,y-v)))) '((_.0 _.0) 1))
+  (check-equal? ((reify (list x-v y-v)) `((,x-v . ,y-v))) '(_.0 _.0))
+  (check-equal? ((reify (list x-v y-v)) empty-sub) '(_.0 _.1))
+  (check-equal? ((reify (list x-v y-v)) `((,x-v . 1))) '(1 _.0)))
 
 #; (-> (or/c #f natural?) goal? (list-of substitution?))
 ; get at most the first n substitutions from the goal, or all of them if n is #f
@@ -294,3 +401,33 @@
   (syntax-rules ()
     [(run* q g ...)
      (run #f q g ...)]))
+
+
+(module+ test
+  (check-equal? (run* q succeed) '(_.0))
+  (check-equal? (run* q fail) '())
+  (check-equal? (run* q (== q 1)) '(1))
+  (check-equal? (run* q (disj (== q 1) (== q 2))) '(1 2))
+  (check-equal? (run* q (conj (== q 1) (== q 2))) '())
+  (check-equal? (run* q (disj succeed (== q 1))) '(_.0 1))
+  (check-equal? (run* q (disj (== q 1) succeed)) '(1 _.0))
+  (check-equal? (run* q (conj (== q 1) succeed)) '(1))
+  (check-equal? (run* q (conj (== q 1) fail)) '())
+  (check-equal? (run* q (disj (== q 1) fail)) '(1))
+  (define-relation (nullo l) (== l '()))
+  (define-relation (conso a d pair) (== (cons a d) pair))
+  (define-relation (appendo xs ys res)
+    (conde [(nullo xs) (== ys res)]
+           [(fresh (x rest-xs rest+ys)
+                   (conso x rest-xs xs)
+                   (conso x rest+ys res)
+                   (appendo rest-xs ys rest+ys))]))
+  (check-equal? (run* q (appendo '() '() q)) '(()))
+  (check-equal? (run* q (appendo '() '(1 2 3) q)) '((1 2 3)))
+  (check-equal? (run* q (appendo '(1 2 3) '(4 5 6) q)) '((1 2 3 4 5 6)))
+  (check-equal? (run* q (appendo q '(4 5 6) '(1 2 3 4 5 6))) '((1 2 3)))
+  (check-equal? (run* (xs ys) (appendo xs ys '(1 2 3))) '((() (1 2 3))
+                                                          ((1) (2 3))
+                                                          ((1 2) (3))
+                                                          ((1 2 3) ())))
+  (check-equal? (run 1 (a b c) (appendo a b c)) '((() _.0 _.0))))
